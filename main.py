@@ -1,115 +1,95 @@
 import streamlit as st
-import pandas as pd
 import sqlite3
+import pandas as pd
 from datetime import datetime, timedelta
 import matplotlib.pyplot as plt
 
-# データベース接続
-conn = sqlite3.connect('forgetting_curve.db', check_same_thread=False)
+# ---- ユーザー認証 ----
+st.sidebar.title("ログイン")
+username = st.sidebar.text_input("ユーザー名を入力してください:", value="guest")
+if st.sidebar.button("ログイン"):
+    st.session_state["username"] = username
+    st.sidebar.success(f"ログインしました: {username}")
+
+# ---- ユーザーごとのデータベースを設定 ----
+db_name = f"user_{st.session_state.get('username', 'guest')}.db"
+conn = sqlite3.connect(db_name, check_same_thread=False)
 c = conn.cursor()
 
-# 必要なテーブルを作成
-c.execute('''
-    CREATE TABLE IF NOT EXISTS problem_sets (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        title TEXT
-    )
-''')
-
-c.execute('''
-    CREATE TABLE IF NOT EXISTS problems (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        set_id INTEGER,
-        problem_number TEXT,
-        next_review_date TEXT,
-        review_interval INTEGER DEFAULT 1,
-        correct_count INTEGER DEFAULT 0,
-        total_count INTEGER DEFAULT 0,
-        FOREIGN KEY (set_id) REFERENCES problem_sets(id)
-    )
-''')
-
-c.execute('''
-    CREATE TABLE IF NOT EXISTS results (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        problem_id INTEGER,
-        result INTEGER, -- 1: 正解, 0: 不正解
-        date TEXT,
-        FOREIGN KEY (problem_id) REFERENCES problems(id)
-    )
-''')
-
-conn.commit()
-
-# 関数：復習タイミングの更新
-def update_review_date(problem_id, is_correct):
-    c.execute('SELECT review_interval, correct_count, total_count FROM problems WHERE id = ?', (problem_id,))
-    data = c.fetchone()
-    
-    if data:
-        interval, correct, total = data
-        total += 1
-
-        if is_correct:
-            correct += 1
-            interval = min(interval * 2, 30)  # 最大30日まで
-        else:
-            interval = 1  # 間隔リセット
-
-        next_review = datetime.now().date() + timedelta(days=interval)
-
-        # 更新
-        c.execute('''
-            UPDATE problems 
-            SET next_review_date = ?, review_interval = ?, correct_count = ?, total_count = ?
-            WHERE id = ?
-        ''', (next_review, interval, correct, total, problem_id))
-        conn.commit()
-
-# 関数：正解率の推移グラフ
-def plot_correct_rate(problem_id):
+# ---- データベースの初期化 ----
+def init_db():
     c.execute('''
-        SELECT date, result FROM results WHERE problem_id = ? ORDER BY date ASC
+        CREATE TABLE IF NOT EXISTS problem_sets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT
+        )
+    ''')
+    
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS problems (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            set_id INTEGER,
+            problem_number TEXT,
+            next_review_date TEXT,
+            correct_streak INTEGER DEFAULT 0,
+            FOREIGN KEY (set_id) REFERENCES problem_sets(id)
+        )
+    ''')
+
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS results (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            problem_id INTEGER,
+            result INTEGER, -- 1: 正解, 0: 不正解
+            date TEXT,
+            FOREIGN KEY (problem_id) REFERENCES problems(id)
+        )
+    ''')
+    conn.commit()
+
+init_db()
+
+## ---- 復習間隔を計算する関数（修正済み）----
+def calculate_next_review(problem_id, is_correct):
+    today = datetime.now().date()
+
+    # `problem_id` が None の場合、何もしない（初回の登録時）
+    if problem_id is None:
+        return today + timedelta(days=2)  # 初回登録時のデフォルト復習日は 2 日後
+
+    # 最新の復習結果を取得
+    c.execute('''
+        SELECT result FROM results WHERE problem_id = ? ORDER BY date DESC LIMIT 1
     ''', (problem_id,))
-    data = c.fetchall()
+    last_result = c.fetchone()
 
-    if not data:
-        return
+    # `correct_streak` を取得（None の場合は 0 に設定）
+    c.execute('SELECT correct_streak FROM problems WHERE id = ?', (problem_id,))
+    correct_streak_data = c.fetchone()
+    correct_streak = correct_streak_data[0] if correct_streak_data else 0
 
-    dates, results = zip(*data)
-    correct_count = [sum(results[:i+1]) / (i+1) * 100 for i in range(len(results))]
+    if is_correct:
+        if last_result and last_result[0] == 0:  # 不正解の次の正解 → 1日後
+            next_review_interval = 1
+            correct_streak = 1  # 連続正解をリセット
+        else:
+            correct_streak += 1
+            next_review_interval = {1: 2, 2: 3, 3: 7, 4: 21}.get(correct_streak, 21)
+    else:
+        next_review_interval = 1  # 不正解 → 1日後
+        correct_streak = 0  # 連続正解リセット
 
-    plt.figure(figsize=(8, 4))
-    plt.plot(dates, correct_count, marker='o', linestyle='-', color='blue')
-    plt.title("正解率の推移")
-    plt.xlabel("日付")
-    plt.ylabel("正解率 (%)")
-    plt.xticks(rotation=45)
-    plt.grid(True)
-    st.pyplot(plt)
+    next_review = today + timedelta(days=next_review_interval)
 
-# 関数：復習スケジュールの棒グラフ
-def plot_review_schedule():
-    c.execute('SELECT problem_number, next_review_date FROM problems ORDER BY next_review_date ASC')
-    data = c.fetchall()
+    # `problems` テーブルを更新
+    c.execute('''
+        UPDATE problems 
+        SET next_review_date = ?, correct_streak = ?
+        WHERE id = ?
+    ''', (next_review, correct_streak, problem_id))
 
-    if not data:
-        return
-
-    problems, dates = zip(*data)
-    dates = [datetime.strptime(d, "%Y-%m-%d") for d in dates]
-
-    plt.figure(figsize=(8, 4))
-    plt.bar(problems, dates, color='orange')
-    plt.title("schedule")
-    plt.xlabel("No")
-    plt.ylabel("Next")
-    plt.xticks(rotation=45)
-    plt.grid(True)
-    st.pyplot(plt)
-
-# ---- UI ----
-st.title("エビングハウスの忘却曲線 - 復習アプリ")
+    conn.commit()
+    return next_review
 
 # **1. 問題集の登録**
 st.subheader("問題集の登録")
@@ -120,29 +100,63 @@ if st.button("問題集を登録"):
         conn.commit()
         st.success(f"問題集 '{new_set}' を登録しました！")
 
-# **2. 問題番号の登録**
-st.subheader("問題番号の登録")
+# ---- 問題登録（修正済み）----
+st.subheader("📝 問題の登録")
+
 c.execute("SELECT * FROM problem_sets")
 sets = c.fetchall()
 set_options = {title: set_id for set_id, title in sets}
 
-selected_set = st.selectbox("問題集を選択:", list(set_options.keys()))
-
+selected_set = st.selectbox("問題集を選択:", list(set_options.keys()), key="set_select")
 new_problem = st.text_input("問題番号を入力:")
-if st.button("問題番号を登録"):
+
+# **キーを動的に変更し、重複エラーを防ぐ**
+initial_result_key = f"initial_result_{new_problem}"
+initial_result = st.radio("初回の挑戦結果:", ["正解", "不正解"], key=initial_result_key)
+
+if st.button("問題を登録（初回挑戦含む）"):
     if new_problem:
         set_id = set_options[selected_set]
-        next_review = datetime.now().date() + timedelta(days=1)
-        c.execute("INSERT INTO problems (set_id, problem_number, next_review_date) VALUES (?, ?, ?)",
-                  (set_id, new_problem, next_review))
-        conn.commit()
-        st.success(f"問題番号 '{new_problem}' を登録しました！")
+        today = datetime.now().date()
+        is_correct = initial_result == "正解"
 
-# **3. 今日の復習**
+        # 問題を登録
+        c.execute('''
+            INSERT INTO problems (set_id, problem_number, next_review_date, correct_streak)
+            VALUES (?, ?, ?, ?)
+        ''', (set_id, new_problem, today + timedelta(days=1), int(is_correct)))
+        conn.commit()
+
+        # `problem_id` を取得
+        c.execute("SELECT id FROM problems WHERE problem_number = ? AND set_id = ?", (new_problem, set_id))
+        problem_data = c.fetchone()
+
+        if problem_data:
+            problem_id = problem_data[0]
+
+            # 初回挑戦の結果を記録
+            c.execute("INSERT INTO results (problem_id, result, date) VALUES (?, ?, ?)", 
+                      (problem_id, int(is_correct), today))
+            conn.commit()
+
+            # 初回の復習日を計算し更新
+            next_review = calculate_next_review(problem_id, is_correct)
+            c.execute('''
+                UPDATE problems 
+                SET next_review_date = ?
+                WHERE id = ?
+            ''', (next_review, problem_id))
+            conn.commit()
+
+            st.success(f"問題 '{new_problem}' を登録し、初回挑戦（{initial_result}）を記録しました！ 次回の復習日は {next_review} です。")
+        else:
+            st.error("問題の登録に失敗しました。")
+
+# ---- 本日の復習リスト ----
 st.subheader("今日の復習")
 today = datetime.now().date()
 c.execute('''
-    SELECT problems.id, problem_sets.title, problems.problem_number, problems.correct_count, problems.total_count 
+    SELECT problems.id, problem_sets.title, problems.problem_number, problems.correct_streak 
     FROM problems 
     JOIN problem_sets ON problems.set_id = problem_sets.id
     WHERE next_review_date = ?
@@ -150,55 +164,15 @@ c.execute('''
 reviews_today = c.fetchall()
 
 if reviews_today:
-    for problem_id, set_title, problem_number, correct, total in reviews_today:
+    for problem_id, set_title, problem_number, correct_streak in reviews_today:
         st.markdown(f"### {set_title} - 問題番号: {problem_number}")
-        st.markdown(f"正解率: {correct}/{total} 回")
+        st.markdown(f"連続正解数: {correct_streak}")
 
-        # 正解・不正解の選択
         result = st.radio(f"結果を選択:", ["正解", "不正解"], key=f"radio_{problem_id}")
-
-        # 結果保存ボタン
         if st.button(f"結果を保存: {problem_number}", key=f"save_{problem_id}"):
-            is_correct = result == "正解"
-            update_review_date(problem_id, is_correct)
-            st.success(f"問題 {problem_number} の結果を保存しました！")
+            record_review_result(problem_id, result == "正解")
             st.rerun()
-
 else:
     st.info("今日の復習はありません。")
-
-# **4. グラフ表示**
-st.subheader("復習スケジュール")
-plot_review_schedule()
-
-st.subheader("正解率の推移")
-problem_id_input = st.number_input("問題IDを入力:", min_value=1, step=1)
-if st.button("正解率を表示"):
-    plot_correct_rate(problem_id_input)
-
-# データベースの初期化関数
-def reset_database():
-    c.execute("DELETE FROM results")
-    c.execute("DELETE FROM problems")
-    c.execute("DELETE FROM problem_sets")
-    conn.commit()
-    
-    # データ削除後、データベースを整理
-    c.execute("VACUUM")
-    conn.commit()
-
-# **データベース初期化**
-st.subheader("データベースの初期化")
-
-if st.button("データベースを初期化する"):
-    st.warning("本当に初期化しますか？ この操作は元に戻せません！")
-    
-    if st.button("はい、初期化する"):
-        reset_database()
-        st.success("データベースを初期化しました！")
-
-        # **セッション情報をクリアして完全リフレッシュ**
-        st.session_state.clear()
-        st.rerun()
 
 conn.close()
