@@ -41,6 +41,7 @@
 
 ```bash
 pip install streamlit pandas matplotlib
+```
 
 ## **実行方法**
 ターミナルで以下のコマンドを実行してください。
